@@ -41,6 +41,7 @@ class Package:
 
         self._cache_lock    = threading.Lock( )
         self._saved         = False
+        self._loaded        = False
         self.load( )
 
 
@@ -71,6 +72,9 @@ class Package:
             return
 
         with self._cache_lock:
+            if self._loaded:
+                return
+
             try:
                 hash = self._package[ "dist" ][ "shasum" ]
 
@@ -79,7 +83,8 @@ class Package:
 
                 self._download_size = metadata.get( "download_size", None )
 
-                self._saved = True
+                self._saved  = True
+                self._loaded = True
 
             except FileNotFoundError:
                 pass
@@ -90,15 +95,18 @@ class Package:
             if self._download_size is not None:
                 return
 
-            response = requests.head( self._package[ "dist" ][ "tarball" ] )
-            if response.status_code != 200:
-                raise RequestsError( response )
+            try:
+                response = requests.head( self._package[ "dist" ][ "tarball" ], headers={ "Accept-Encoding": "identity" } )
+                if response.status_code != 200:
+                    raise RequestsError( response )
 
-            self._download_size = int( response.headers[ "content-length" ] )
+                self._download_size = int( response.headers[ "content-length" ] )
 
-            self._populated = True
+                self._populated = True
 
-            self.save( )
+                self.save( )
+            except Exception as e:
+                raise RuntimeError( "Failed to populate %s" % self.name )
 
 
     @property
@@ -120,7 +128,7 @@ class Package:
     def dependencies( self, include_dev: bool = False ) -> Iterable[str]:
         dependencies = set( ) # type: Set[str]
 
-        types = [ "dependencies" ]
+        types = [ "dependencies", "peerDependencies" ]
         if include_dev:
             types.append( "devDependencies" )
 
@@ -184,6 +192,7 @@ class Manifest:
 
         self._cache_lock = threading.Lock( )
         self._saved      = False
+        self._loaded     = False
 
         self.load( )
 
@@ -219,6 +228,9 @@ class Manifest:
             return
 
         with self._cache_lock:
+            if self._loaded:
+                return
+
             try:
                 name = urllib.parse.quote( self.name, safe='' )
 
@@ -234,10 +246,11 @@ class Manifest:
                 if last_update:
                     self._last_update = datetime.datetime.fromisoformat( last_update )
                     diff = datetime.timedelta( minutes=30 )
-                    if diff >= self._last_update - datetime.datetime.now( ):
+                    if diff >= datetime.datetime.now( ) - self._last_update:
                         self._stale = False
 
-                self._saved = True
+                self._saved  = True
+                self._loaded = True
             except FileNotFoundError:
                 pass
             except:
@@ -410,7 +423,7 @@ class RecursiveResolver:
 
     def __init__( self ):
         self._loop          = asyncio.new_event_loop( )
-        self._executor      = concurrent.futures.ThreadPoolExecutor( max_workers=16 )
+        self._executor      = concurrent.futures.ThreadPoolExecutor( max_workers=5 )
         self._state_lock    = asyncio.Lock( )
 
         self._nodes         = {} # type: Dict[Package, ResolveNode]
@@ -647,9 +660,11 @@ class Mirror:
         with self._lock:
             if name in self._manifest_cache:
                 manifest = self._manifest_cache[ name ]
+                manifest.load( )
 
             if manifest is None:
                 manifest = Manifest( self, name )
+                self._manifest_cache[ name ] = manifest
 
         if not manifest.exists( ) and not populate:
             raise PackageNotFoundError( "Package %s does not exist" % name )
@@ -657,15 +672,6 @@ class Mirror:
         if populate:
             # This will raise PackageNotFoundError if not found
             manifest.manifest
-
-        save = False
-
-        with self._lock:
-            if name in self._manifest_cache:
-                manifest = self._manifest_cache[ name ]
-            else:
-                self._manifest_cache[ name ] = manifest
-                save = True
 
         return manifest
 
